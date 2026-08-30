@@ -1,0 +1,66 @@
+name: Deploy minio-basic to k3s
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "k8s/**"
+      - "config/**"
+      - ".github/workflows/**"
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install sops & age (AMD64)
+        run: |
+          if ! command -v sops &> /dev/null; then
+            SOPS_VERSION=$(curl -sI https://github.com/getsops/sops/releases/latest | grep -i location | grep -oP 'v\K[0-9.]+')
+            wget -O /tmp/sops "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64"
+            sudo mv /tmp/sops /usr/local/bin/sops
+            sudo chmod +x /usr/local/bin/sops
+          fi
+          if ! command -v age &> /dev/null; then
+            AGE_VERSION=$(curl -sI https://github.com/FiloSottile/age/releases/latest | grep -i location | grep -oP 'v\K[0-9.]+')
+            wget -O /tmp/age.tar.gz "https://github.com/FiloSottile/age/releases/latest/download/age-v${AGE_VERSION}-linux-amd64.tar.gz"
+            sudo tar -xzf /tmp/age.tar.gz -C /usr/local/bin --strip-components=1 age/age age/age-keygen
+            rm -f /tmp/age.tar.gz
+          fi
+
+      - name: Set age decryption key
+        run: |
+          echo "SOPS_AGE_KEY<<EOF" >> $GITHUB_ENV
+          echo "${{ secrets.SOPS_AGE_KEY }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Decrypt secrets and create k3s secret
+        run: |
+          sops -d --input-type dotenv --output-type dotenv config/secrets.production.enc > /tmp/.env
+          source /tmp/.env
+          # Validar que las variables requeridas no estén vacías
+          for var in MINIO_ROOT_USER MINIO_ROOT_PASSWORD; do
+            if [ -z "${!var}" ]; then
+              echo "ERROR: $var está vacío después de decryptar secrets"
+              exit 1
+            fi
+          done
+          kubectl create secret generic minio-credentials \
+            --from-literal=root-user="$MINIO_ROOT_USER" \
+            --from-literal=root-password="$MINIO_ROOT_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          rm -f /tmp/.env
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -f k8s/minio-basic-pvc.yaml
+          kubectl apply -f k8s/minio-basic-deployment.yaml
+          kubectl apply -f k8s/minio-basic-service.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment minio-basic --timeout=180s
